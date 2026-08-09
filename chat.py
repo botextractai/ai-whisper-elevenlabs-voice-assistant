@@ -3,7 +3,9 @@ import os
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 from dotenv import load_dotenv
-from elevenlabs import generate
+from speechify import Speechify
+from speechify.tts import GetSpeechOptionsRequest
+import base64
 from langchain.chains import RetrievalQA
 from langchain.chat_models import ChatOpenAI
 from langchain.embeddings.openai import OpenAIEmbeddings
@@ -18,8 +20,55 @@ TEMP_AUDIO_PATH = "temp_audio.wav"
 AUDIO_FORMAT = "audio/wav"
 
 openai_api_key = os.environ.get('OPENAI_API_KEY')
-eleven_api_key = os.environ.get('ELEVEN_API_KEY')
+speechify_api_key = os.environ.get('SPEECHIFY_API_KEY')
 dataset_path = 'hub://' + os.environ.get('ACTIVELOOP_ORG_ID') + '/voice-assistant'
+
+# Initialize Speechify client
+speechify_client = Speechify(token=speechify_api_key) if speechify_api_key else None
+
+def filter_voice_models(voices, *, gender=None, locale=None, tags=None):
+    """
+    Filter Speechify voices by gender, locale, and/or tags,
+    and return the list of voice IDs for matching voices.
+
+    Args:
+        voices (list): List of voice objects.
+        gender (str, optional): e.g. 'male', 'female'.
+        locale (str, optional): e.g. 'en-US'.
+        tags (list, optional): list of tags, e.g. ['timbre:deep', 'use-case:advertisement'].
+
+    Returns:
+        list[str]: IDs of matching voices.
+    """
+    results = []
+
+    for voice in voices:
+        # gender filter
+        if gender and getattr(voice, 'gender', '').lower() != gender.lower():
+            continue
+
+        # For now, we'll include all voices since the structure might be different
+        # We can refine this later based on the actual voice object structure
+        voice_id = getattr(voice, 'id', None)
+        if voice_id:
+            results.append(voice_id)
+
+    return results
+
+def get_available_voices():
+    """
+    Get available voices from Speechify API.
+    Returns a list of voice objects or None if API key is not configured.
+    """
+    if not speechify_client:
+        return None
+    
+    try:
+        voices_response = speechify_client.tts.voices.list()
+        return voices_response  # The response is already a list
+    except Exception as e:
+        print(f"Error fetching voices: {str(e)}")
+        return None
 
 def load_embeddings_and_database(active_loop_data_set_path):
     embeddings = OpenAIEmbeddings()
@@ -86,16 +135,66 @@ def display_conversation(history):
     for i in range(len(history["generated"])):
         message(history["past"][i], is_user=True, key=str(i) + "_user")
         message(history["generated"][i],key=str(i))
-        # Voice using Eleven API
-        voice= "Bella"
-        text= history["generated"][i]
-        audio = generate(text=text, voice=voice,api_key=eleven_api_key)
-        st.audio(audio, format='audio/mp3')
+        # Voice using Speechify API
+        if speechify_client:
+            text = history["generated"][i]
+            try:
+                audio_response = speechify_client.tts.audio.speech(
+                    audio_format="mp3",
+                    input=text,
+                    language="en-US",
+                    model="simba-english",
+                    options=GetSpeechOptionsRequest(
+                        loudness_normalization=True,
+                        text_normalization=True
+                    ),
+                    voice_id=st.session_state.get("selected_voice_id", "voice_id")
+                )
+                audio_bytes = base64.b64decode(audio_response.audio_data)
+                st.audio(audio_bytes, format='audio/mp3')
+            except Exception as e:
+                st.error(f"Error generating speech: {str(e)}")
+        else:
+            st.warning("Speechify API key not configured. Audio generation disabled.")
 
 # Main function to run the app
 def main():
     # Initialise Streamlit app with a title
     st.write("# Voice Assistant")
+    
+    # Voice selection sidebar
+    st.sidebar.header("Voice Settings")
+    selected_voice_id = "voice_id"  # Default fallback
+    
+    if speechify_client:
+        voices = get_available_voices()
+        if voices:
+            # Get all available voice IDs
+            available_voices = filter_voice_models(voices)
+            if available_voices:
+                # Create a mapping of voice IDs to display names
+                voice_options = {f"Voice {i+1} ({voices[i].gender if hasattr(voices[i], 'gender') else 'Unknown'})": voice_id 
+                               for i, voice_id in enumerate(available_voices[:20])}  # Limit to first 20 voices
+                
+                selected_voice_name = st.sidebar.selectbox(
+                    "Select Voice",
+                    options=list(voice_options.keys()),
+                    index=0
+                )
+                selected_voice_id = voice_options[selected_voice_name]
+            else:
+                st.sidebar.warning("No voices found")
+        else:
+            st.sidebar.warning("Could not fetch voices from Speechify")
+    else:
+        st.sidebar.warning("Speechify API key not configured")
+    
+    # Store selected voice in session state
+    if "selected_voice_id" not in st.session_state:
+        st.session_state["selected_voice_id"] = selected_voice_id
+    else:
+        st.session_state["selected_voice_id"] = selected_voice_id
+    
     # Load embeddings and the DeepLake database
     db = load_embeddings_and_database(dataset_path)
     # Record and transcribe audio
